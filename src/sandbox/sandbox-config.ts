@@ -715,7 +715,7 @@ export const NetworkConfigSchema = z.object({
     .array(z.string())
     .optional()
     .describe(
-      'macOS only: Unix socket paths to allow. Ignored on Linux (seccomp cannot filter by path).',
+      'Unix socket paths to allow. On Linux this requires the Landstrip backend; the legacy seccomp backend ignores path-specific allowances.',
     ),
   allowAllUnixSockets: z
     .boolean()

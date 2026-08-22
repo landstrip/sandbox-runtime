@@ -222,16 +222,19 @@ describe.if(isLinux || isMacOS)(
 
     /** Whether the wrapped command makes `dir` writable. */
     function grantsWrite(wrapped: string, dir: string): boolean {
-      if (isLinux) return wrapped.includes(`--bind ${dir} ${dir}`)
-      const rule = wrapped.slice(wrapped.indexOf('(allow file-write*'))
-      return rule.slice(0, rule.indexOf('(with message')).includes(dir)
+      const policy = JSON.parse(wrapped) as {
+        filesystem: { allowWrite: string[] }
+      }
+      return policy.filesystem.allowWrite.some(p => p.endsWith(dir))
     }
 
     it('reaches getFsWriteConfig() and the wrapped command', () => {
       mkdirSync(join(fakeHome, NPM_LOGS), { recursive: true })
       const { allowOnly, wrapped, reopened } = runWithHome(
         fakeHome,
-        `const { SandboxManager } = await import('./src/sandbox/sandbox-manager.ts')
+        `const { readFileSync } = await import('node:fs')
+       const { SandboxManager } = await import('./src/sandbox/sandbox-manager.ts')
+       const policyOf = ({ argv }) => readFileSync(argv[argv.indexOf('-p') + 1], 'utf8')
        const filesystem = { denyRead: ['~/.npm'], allowWrite: [], denyWrite: [] }
        await SandboxManager.initialize({
          network: { allowedDomains: [], deniedDomains: [] },
@@ -240,10 +243,10 @@ describe.if(isLinux || isMacOS)(
        })
        const out = {
          allowOnly: SandboxManager.getFsWriteConfig().allowOnly,
-         wrapped: await SandboxManager.wrapWithSandbox('true'),
-         reopened: await SandboxManager.wrapWithSandbox('true', undefined, {
+         wrapped: policyOf(await SandboxManager.wrapWithSandboxArgv('true')),
+         reopened: policyOf(await SandboxManager.wrapWithSandboxArgv('true', undefined, {
            filesystem: { ...filesystem, allowRead: ['~/.npm/_logs'] },
-         }),
+         })),
        }
        await SandboxManager.reset()
        process.stdout.write(JSON.stringify(out) + '\\n', () => process.exit(0))`,
@@ -261,18 +264,23 @@ describe.if(isLinux || isMacOS)(
       mkdirSync(join(fakeHome, NPM_LOGS), { recursive: true })
       const wrapped = runWithHome(
         fakeHome,
-        `const { SandboxManager } = await import('./src/sandbox/sandbox-manager.ts')
-       console.log(JSON.stringify(await SandboxManager.wrapWithSandbox('true', undefined, {
+        `const { readFileSync } = await import('node:fs')
+       const { SandboxManager } = await import('./src/sandbox/sandbox-manager.ts')
+       const { argv } = await SandboxManager.wrapWithSandboxArgv('true', undefined, {
          filesystem: { denyRead: [], allowWrite: [], denyWrite: ['~/.npm'] },
-       })))`,
+       })
+       const policy = readFileSync(argv[argv.indexOf('-p') + 1], 'utf8')
+       await SandboxManager.reset()
+       console.log(JSON.stringify(policy))`,
       ) as string
 
       const npm = join(fakeHome, '.npm')
+      const policy = JSON.parse(wrapped) as {
+        filesystem: { allowWrite: string[]; denyWrite: string[] }
+      }
       expect(grantsWrite(wrapped, join(fakeHome, NPM_LOGS))).toBe(true)
-      expect(wrapped.indexOf(`--ro-bind ${npm} ${npm}`)).toBeGreaterThan(
-        wrapped.indexOf(`--bind ${npm}/_logs ${npm}/_logs`),
-      )
-      expect(wrapped).not.toContain(`--ro-bind ${fakeHome}/.claude`)
+      expect(policy.filesystem.denyWrite).toContain(npm)
+      expect(policy.filesystem.denyWrite).not.toContain(`${fakeHome}/.claude`)
     })
   },
 )

@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process'
 import {
   existsSync,
   mkdirSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -190,18 +191,6 @@ describe.if(isSupportedPlatform)(
     const SETTINGS_FILE = join(TEST_DIR, 'credentials.json')
     let platformDescriptor: PropertyDescriptor | undefined
 
-    const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    // Matches (subpath "<path>") as any of the filters listed under a
-    // (deny file-read* …) rule. The profile is embedded byte-literal inside
-    // a single-quoted argument, so the inner quotes appear exactly as
-    // written (never backslash-escaped).
-    const denyReadRule = (p: string) =>
-      new RegExp(
-        String.raw`\(deny file-read\*(\n  \([^\n]*\))*\n  \(subpath "` +
-          escapeRegExp(p) +
-          '"',
-      )
-
     beforeAll(async () => {
       mkdirSync(TEST_DIR, { recursive: true })
       writeFileSync(SECRET_FILE, 'token-abc\n')
@@ -252,20 +241,25 @@ describe.if(isSupportedPlatform)(
         wrapped.indexOf('SANDBOX_RUNTIME'),
       )
       expect(wrapped.indexOf('-u MY_API_TOKEN')).toBeLessThan(
-        wrapped.indexOf('sandbox-exec'),
+        wrapped.indexOf('landstrip'),
       )
     })
 
     it('denies reads of the declared credential file in the profile', async () => {
       const wrapped = await SandboxManager.wrapWithSandbox(`cat ${SECRET_FILE}`)
 
-      expect(wrapped).toContain('sandbox-exec')
-      expect(wrapped).toMatch(
-        denyReadRule(normalizePathForSandbox(SECRET_FILE)),
+      expect(wrapped).toContain('landstrip')
+      const policyPath = wrapped.match(/-p (\S+)/)?.[1]
+      expect(policyPath).toBeDefined()
+      const policy = JSON.parse(readFileSync(policyPath!, 'utf8')) as {
+        filesystem: { denyRead: string[] }
+      }
+      expect(policy.filesystem.denyRead).toContain(
+        normalizePathForSandbox(SECRET_FILE),
       )
       // No implicit denies: undeclared credential paths stay out of the profile.
-      expect(wrapped).not.toMatch(
-        denyReadRule(normalizePathForSandbox('~/.netrc')),
+      expect(policy.filesystem.denyRead).not.toContain(
+        normalizePathForSandbox('~/.netrc'),
       )
     })
   },

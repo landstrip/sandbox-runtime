@@ -152,7 +152,7 @@ const sessionSuffix = `_${Math.random().toString(36).slice(2, 11)}_SBX`
  * Generate a unique log tag for sandbox monitoring
  * @param command - The command being executed (will be base64 encoded)
  */
-function generateLogTag(command: string): string {
+export function generateLogTag(command: string): string {
   const encodedCommand = encodeSandboxedCommand(command)
   return `CMD64_${encodedCommand}_END_${sessionSuffix}`
 }

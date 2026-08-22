@@ -4,7 +4,8 @@ import { quote } from './utils/shell-quote.js'
 import { Command, InvalidArgumentError } from 'commander'
 import { SandboxManager } from './index.js'
 import type { SandboxRuntimeConfig } from './sandbox/sandbox-config.js'
-import { spawn, type ChildProcess } from 'child_process'
+import { spawn, spawnSync, type ChildProcess } from 'child_process'
+import { binaryPath } from '@landstrip/landstrip-api'
 import { logForDebugging } from './utils/debug.js'
 import { loadConfig, loadConfigFromString } from './utils/config-loader.js'
 import * as readline from 'readline'
@@ -182,89 +183,22 @@ async function main(): Promise<void> {
     )
     .version(getPackageVersion())
 
-  // ── Windows install/uninstall ─────────────────────────────────
-  // Self-elevating one-shot install (one UAC prompt). Also
-  // available programmatically as installWindowsSandbox().
-  program
-    .command('windows-install')
-    .description(
-      'Windows: provision the `srt-sandbox` user account + install WFP ' +
-        'filters (one UAC prompt). No logout needed.',
-    )
-    .option('--sublayer-guid <guid>', 'WFP sublayer GUID')
-    .option(
-      '--proxy-port-range <lo-hi>',
-      'loopback PERMIT port range (e.g. 60080-60089)',
-    )
-    .option(
-      '--sandbox-user <name>',
-      'name for the sandbox user account (default: srt-sandbox)',
-    )
-    .option('--force', 'replace an existing install with different config')
-    .action(async (o: Record<string, string | boolean | undefined>) => {
-      const { installWindowsSandbox, resolveSrtWin, VENDORED_SRT_WIN_EXE } =
-        await import('./sandbox/windows-sandbox-utils.js')
-      const range =
-        typeof o.proxyPortRange === 'string'
-          ? (o.proxyPortRange.split('-').map(Number) as [number, number])
-          : undefined
-      try {
-        const r = installWindowsSandbox({
-          sublayerGuid: o.sublayerGuid as string | undefined,
-          proxyPortRange: range,
-          sandboxUser: o.sandboxUser as string | undefined,
-          force: Boolean(o.force),
-          // Our own CLI opts into the packaged exe explicitly —
-          // there is no ambient vendor fallback.
-          srtWin: resolveSrtWin({ path: VENDORED_SRT_WIN_EXE }),
-        })
-        if (r.cancelled) {
-          console.error('Install cancelled at the UAC prompt. Nothing changed.')
-          process.exit(2)
+  for (const action of ['install', 'uninstall', 'status'] as const) {
+    program
+      .command(`windows-${action}`)
+      .description(`Windows: ${action} native Landstrip isolation`)
+      .action(() => {
+        if (process.platform !== 'win32') {
+          throw new Error('Windows sandbox administration requires Windows')
         }
-        console.log(
-          `Installed.\n` +
-            `  sandbox user: ${r.user.provisioned ? 'provisioned' : 'MISSING'}` +
-            (r.user.sid ? ` (${r.user.sid})` : '') +
-            `\n` +
-            `  WFP:   ${r.wfp.state}, ${r.wfp.filters} filters` +
-            (r.wfp.portRange
-              ? `, port range ${r.wfp.portRange[0]}-${r.wfp.portRange[1]}`
-              : '') +
-            `\n\n` +
-            `No logout needed — the WFP filter keys on the dedicated ` +
-            `\`srt-sandbox\` user's SID, so your network is unaffected.`,
-        )
-      } catch (e) {
-        console.error(`Error: ${(e as Error).message}`)
-        process.exit(1)
-      }
-    })
-
-  program
-    .command('windows-uninstall')
-    .description(
-      'Windows: remove WFP filters + the `srt-sandbox` account (one UAC prompt).',
-    )
-    .option('--sublayer-guid <guid>', 'WFP sublayer GUID')
-    .action(async (o: Record<string, string | undefined>) => {
-      const { uninstallWindowsSandbox, resolveSrtWin, VENDORED_SRT_WIN_EXE } =
-        await import('./sandbox/windows-sandbox-utils.js')
-      try {
-        const r = uninstallWindowsSandbox({
-          sublayerGuid: o.sublayerGuid,
-          srtWin: resolveSrtWin({ path: VENDORED_SRT_WIN_EXE }),
+        const result = spawnSync(binaryPath(), ['windows', action], {
+          stdio: 'inherit',
+          windowsHide: true,
         })
-        if (r.cancelled) {
-          console.error('Uninstall cancelled at the UAC prompt.')
-          process.exit(2)
-        }
-        console.log('WFP filters and `srt-sandbox` account removed.')
-      } catch (e) {
-        console.error(`Error: ${(e as Error).message}`)
-        process.exit(1)
-      }
-    })
+        if (result.error) throw result.error
+        process.exitCode = result.status ?? 1
+      })
+  }
 
   program
     .command('proxy')
@@ -351,26 +285,6 @@ async function main(): Promise<void> {
             case 'invalid':
               refuseSettings(loaded.reason, FILE_RULES)
               break
-          }
-
-          // Windows: srtWin.path is required (no ambient vendor
-          // fallback). When the user's config doesn't set it, this
-          // CLI opts into the packaged exe explicitly — that's our
-          // code making the choice, not a library default.
-          if (
-            process.platform === 'win32' &&
-            runtimeConfig.windows?.srtWin?.path === undefined
-          ) {
-            const { VENDORED_SRT_WIN_EXE } = await import(
-              './sandbox/windows-sandbox-utils.js'
-            )
-            runtimeConfig = {
-              ...runtimeConfig,
-              windows: {
-                ...runtimeConfig.windows,
-                srtWin: { path: VENDORED_SRT_WIN_EXE },
-              },
-            }
           }
 
           // The wrapped command, once it exists: a control channel that

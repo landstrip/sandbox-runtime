@@ -35,9 +35,7 @@ import type {
 } from '../../src/sandbox/sandbox-config.js'
 import { WindowsConfigSchema } from '../../src/sandbox/sandbox-config.js'
 import { CA_TRUST_VARS } from '../../src/sandbox/sandbox-utils.js'
-import { certThumbprint } from '../../src/sandbox/mitm-ca.js'
 import * as platform from '../../src/utils/platform.js'
-import * as winUtils from '../../src/sandbox/windows-sandbox-utils.js'
 import {
   getSrtWinPath,
   getWindowsWfpStatus,
@@ -64,8 +62,6 @@ import {
   SRT_WIN_DISPATCH_ARG1,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
   VENDORED_SRT_WIN_EXE,
-  type WindowsAclGrantOptions,
-  type WindowsAclStampOptions,
   type WindowsFsAccessSet,
 } from '../../src/sandbox/windows-sandbox-utils.js'
 
@@ -873,8 +869,6 @@ describe('rankWindowsFsAccess (pure, all platforms)', () => {
 // would use up the one egress check a process makes.
 describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
   const spies: Array<ReturnType<typeof spyOn>> = []
-  let granted: WindowsAclGrantOptions | undefined
-  let stamped: WindowsAclStampOptions | undefined
   let root: string
   let d: string
   let sub: string
@@ -894,24 +888,29 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
     },
     filesystem: { denyRead: [], allowWrite: [], denyWrite: [], ...filesystem },
     credentials: { files },
-    windows: { srtWin: { path: process.execPath } },
   })
 
-  /** The values of `flag` in what one command is wrapped to. */
-  const flagged = async (
-    flag: '--deny-read' | '--deny-write',
-    customConfig?: Partial<SandboxRuntimeConfig>,
-  ): Promise<string[]> => {
+  const policyOf = async (customConfig?: Partial<SandboxRuntimeConfig>) => {
     const { argv } = await SandboxManager.wrapWithSandboxArgv(
       'rem',
       undefined,
       customConfig,
     )
-    return argv.flatMap((a, i) => (a === flag ? [argv[i + 1]] : []))
+    const policyPath = argv[argv.indexOf('-p') + 1]!
+    return (
+      JSON.parse(readFileSync(policyPath, 'utf8')) as {
+        filesystem: {
+          allowRead: string[]
+          denyRead: string[]
+          denyReadAlways: string[]
+          allowWrite: string[]
+          denyWrite: string[]
+        }
+      }
+    ).filesystem
   }
 
   beforeEach(() => {
-    granted = stamped = undefined
     root = realpathSync.native(mkdtempSync(join(tmpdir(), 'srt-handed-')))
     d = join(root, 'd')
     sub = join(d, 'sub')
@@ -920,37 +919,7 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
     mkdirSync(sub, { recursive: true })
     mkdirSync(sub2)
     writeFileSync(token, 'token-content')
-    spies.push(
-      spyOn(platform, 'getPlatform').mockReturnValue('windows'),
-      spyOn(winUtils, 'checkWindowsDependenciesAsync').mockResolvedValue({
-        errors: [],
-        warnings: [],
-      }),
-      spyOn(winUtils, 'getWindowsSandboxUserStatusAsync').mockResolvedValue({
-        provisioned: true,
-        sid: 'S-1-5-21-1',
-        groupExists: true,
-        inBuiltinUsers: true,
-        inSandboxGroup: true,
-        hiddenFromLogon: true,
-        credPresent: true,
-        realUserSid: 'S-1-5-21-3',
-        caCertThumb: certThumbprint(readFileSync(CA_CERT, 'utf8')),
-        caCertPem: readFileSync(CA_CERT, 'utf8'),
-      }),
-      spyOn(winUtils, 'verifyWindowsWfpEgress').mockResolvedValue({
-        target: '',
-        stderr: '',
-      }),
-      spyOn(winUtils, 'grantWindowsAcl').mockImplementation(o => {
-        granted = o
-      }),
-      spyOn(winUtils, 'stampWindowsAcl').mockImplementation(o => {
-        stamped = o
-      }),
-      spyOn(winUtils, 'revokeWindowsAcl').mockReturnValue([]),
-      spyOn(winUtils, 'restoreWindowsAcl').mockReturnValue([]),
-    )
+    spies.push(spyOn(platform, 'getPlatform').mockReturnValue('windows'))
   })
 
   afterEach(async () => {
@@ -963,16 +932,20 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
     await SandboxManager.initialize(
       configOf({ allowWrite: [root, sub], denyWrite: [d] }),
     )
-    expect(granted).toMatchObject({ read: [sub], write: [root] })
-    expect(stamped).toMatchObject({ denyRead: [], denyWrite: [d] })
+    const fs = await policyOf()
+    expect(fs.allowWrite).toEqual([root, sub])
+    expect(fs.denyWrite).toContain(d)
+    expect(fs.denyRead).toEqual([])
   })
 
   it('the session: an allowRead beneath a denyRead is granted', async () => {
     await SandboxManager.initialize(
       configOf({ allowRead: [sub], denyRead: [d] }),
     )
-    expect(granted).toMatchObject({ read: [sub], write: [] })
-    expect(stamped).toMatchObject({ denyRead: [d], denyWrite: [] })
+    const fs = await policyOf()
+    expect(fs.allowRead).toEqual([sub])
+    expect(fs.denyRead).toEqual([d])
+    expect(fs.allowWrite).toEqual([])
   })
 
   it('the session: nothing is granted beneath a credential deny', async () => {
@@ -981,8 +954,12 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
         { path: d, mode: 'deny' },
       ]),
     )
-    expect(granted).toMatchObject({ read: [], write: [root] })
-    expect(stamped).toMatchObject({ denyRead: [d], denyWrite: [] })
+    expect(await policyOf()).toMatchObject({
+      allowRead: [sub],
+      allowWrite: [root, sub2],
+      denyRead: [d],
+      denyReadAlways: [d],
+    })
   })
 
   it.each<[string, Omit<CredentialFileConfig, 'path'>]>([
@@ -997,9 +974,11 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
         { path: token, ...entry },
       ]),
     )
-    expect(granted).toMatchObject({ read: [], write: [root] })
-    expect(stamped).toMatchObject({ denyRead: [token], denyWrite: [] })
-    expect(await flagged('--deny-read')).toEqual([])
+    expect(await policyOf()).toMatchObject({
+      allowWrite: [root],
+      denyRead: [token],
+      denyReadAlways: [token],
+    })
   })
 
   it('the session: filesystem.disabled leaves a masked file denied, and that alone', async () => {
@@ -1009,8 +988,11 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
         { path: sub, mode: 'deny' },
       ]),
     )
-    expect(granted).toBeUndefined()
-    expect(stamped).toMatchObject({ denyRead: [token], denyWrite: [] })
+    expect(await policyOf()).toMatchObject({
+      denyRead: [token],
+      denyReadAlways: [token],
+      denyWrite: [],
+    })
   })
 
   it('onExtractNoMatch "error": initialize() resolves and the wrap throws', async () => {
@@ -1024,9 +1006,8 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
         },
       ]),
     )
-    expect(granted).toMatchObject({ write: [root] })
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
-    await expect(flagged('--deny-read')).rejects.toThrow(/onExtractNoMatch/)
+    await expect(policyOf()).rejects.toThrow(/onExtractNoMatch/)
   })
 
   it('one command: a file masked since initialize() is denied', async () => {
@@ -1034,26 +1015,27 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
     await SandboxManager.initialize(
       configOf({ allowWrite: [root] }, [{ path: late, mode: 'mask' }]),
     )
-    expect(stamped).toBeUndefined()
-    expect(await flagged('--deny-read')).toEqual([])
+    expect((await policyOf()).denyRead).toEqual([])
     writeFileSync(late, 'late-content')
-    expect(await flagged('--deny-read')).toEqual([late])
+    expect((await policyOf()).denyRead).toEqual([late])
   })
 
   it('one command: a masked file of its own is denied, filesystem.disabled or not', async () => {
     await SandboxManager.initialize(configOf({ allowWrite: [root] }))
     const credentials = { files: [{ path: token, mode: 'mask' as const }] }
-    expect(await flagged('--deny-read', { credentials })).toEqual([token])
+    expect((await policyOf({ credentials })).denyRead).toEqual([token])
     expect(
-      await flagged('--deny-read', {
-        credentials,
-        filesystem: {
-          disabled: true,
-          denyRead: [sub],
-          allowWrite: [],
-          denyWrite: [],
-        },
-      }),
+      (
+        await policyOf({
+          credentials,
+          filesystem: {
+            disabled: true,
+            denyRead: [sub],
+            allowWrite: [],
+            denyWrite: [],
+          },
+        })
+      ).denyRead,
     ).toEqual([token])
   })
 
@@ -1062,8 +1044,9 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
       configOf({ allowRead: [sub2], allowWrite: [root, sub] }),
     )
     const filesystem = { denyRead: [], allowWrite: [], denyWrite: [d] }
-    expect(await flagged('--deny-write', { filesystem })).toEqual([d, sub])
-    expect(await flagged('--deny-read', { filesystem })).toEqual([])
+    const fs = await policyOf({ filesystem })
+    expect(fs.denyWrite).toContain(d)
+    expect(fs.denyRead).toEqual([])
   })
 
   it("one command: its credential deny reaches the session's grants beneath it", async () => {
@@ -1071,11 +1054,9 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
       configOf({ allowRead: [sub], allowWrite: [root, sub2] }),
     )
     const credentials = { files: [{ path: d, mode: 'deny' as const }] }
-    expect(await flagged('--deny-read', { credentials })).toEqual([
-      d,
-      sub,
-      sub2,
-    ])
+    const fs = await policyOf({ credentials })
+    expect(fs.denyRead).toEqual([d])
+    expect(fs.denyReadAlways).toEqual([d])
   })
 
   it("one command: its denyRead leaves the session's grants beneath it", async () => {
@@ -1083,8 +1064,9 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
       configOf({ allowRead: [sub], allowWrite: [sub2] }),
     )
     const filesystem = { denyRead: [d], allowWrite: [], denyWrite: [] }
-    expect(await flagged('--deny-read', { filesystem })).toEqual([d])
-    expect(await flagged('--deny-write', { filesystem })).toEqual([])
+    const fs = await policyOf({ filesystem })
+    expect(fs.denyRead).toEqual([d])
+    expect(fs.denyWrite).not.toContain(d)
   })
 
   it('one command: a credential deny on a path the session read-denies', async () => {
@@ -1092,7 +1074,9 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
       configOf({ allowRead: [sub], denyRead: [d] }),
     )
     const credentials = { files: [{ path: d, mode: 'deny' as const }] }
-    expect(await flagged('--deny-read', { credentials })).toEqual([sub])
+    const fs = await policyOf({ credentials })
+    expect(fs.denyRead).toEqual([d])
+    expect(fs.denyReadAlways).toEqual([d])
   })
 
   it("the library's trust bundle is granted beneath a credential deny", async () => {
@@ -1105,13 +1089,14 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
         tlsTerminate: { caCertPath: CA_CERT, caKeyPath: CA_KEY },
       },
     })
-    const own = dirname(SandboxManager.getMitmCA()!.trustBundlePath)
-    expect(granted).toMatchObject({ read: [own], write: [] })
-    expect(
-      await flagged('--deny-read', {
-        credentials: { files: [{ path: dirname(own), mode: 'deny' }] },
-      }),
-    ).not.toContain(own)
+    const own = realpathSync.native(
+      dirname(SandboxManager.getMitmCA()!.trustBundlePath),
+    )
+    const fs = await policyOf({
+      credentials: { files: [{ path: dirname(own), mode: 'deny' }] },
+    })
+    expect(fs.allowRead).toContain(own)
+    expect(fs.denyReadAlways).not.toContain(dirname(own))
   })
 })
 

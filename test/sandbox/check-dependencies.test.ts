@@ -32,7 +32,7 @@ describe('SandboxManager.checkDependencies: ripgrep', () => {
     expect(result.errors).not.toContain('ripgrep (rg) not found')
   })
 
-  test('linux: errors when rg is missing', () => {
+  test('linux: no error when rg is missing', () => {
     platformSpy.mockReturnValue('linux')
     whichSpy.mockImplementation((bin: string) =>
       bin === 'rg' ? null : `/usr/bin/${bin}`,
@@ -40,10 +40,10 @@ describe('SandboxManager.checkDependencies: ripgrep', () => {
 
     const result = SandboxManager.checkDependencies()
 
-    expect(result.errors).toContain('ripgrep (rg) not found')
+    expect(result.errors).not.toContain('ripgrep (rg) not found')
   })
 
-  test('linux: honours explicit ripgrepConfig.command', () => {
+  test('linux: ignores missing explicit ripgrepConfig.command', () => {
     platformSpy.mockReturnValue('linux')
     whichSpy.mockImplementation((bin: string) =>
       bin === 'custom-rg' ? null : `/usr/bin/${bin}`,
@@ -51,7 +51,7 @@ describe('SandboxManager.checkDependencies: ripgrep', () => {
 
     const result = SandboxManager.checkDependencies({ command: 'custom-rg' })
 
-    expect(result.errors).toContain('ripgrep (custom-rg) not found')
+    expect(result.errors).not.toContain('ripgrep (custom-rg) not found')
   })
 })
 
@@ -67,7 +67,7 @@ describe('SandboxManager.checkDependenciesAsync', () => {
     expect(await p).toEqual(SandboxManager.checkDependencies())
   })
 
-  test('honours explicit ripgrepConfig.command', async () => {
+  test('ignores missing explicit ripgrepConfig.command', async () => {
     platformSpy.mockReturnValue('linux')
     whichSpy.mockImplementation((bin: string) =>
       bin === 'custom-rg' ? null : `/usr/bin/${bin}`,
@@ -77,6 +77,6 @@ describe('SandboxManager.checkDependenciesAsync', () => {
       command: 'custom-rg',
     })
 
-    expect(result.errors).toContain('ripgrep (custom-rg) not found')
+    expect(result.errors).not.toContain('ripgrep (custom-rg) not found')
   })
 })

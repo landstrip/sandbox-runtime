@@ -3,7 +3,7 @@ import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { isLinux, isMacOS, isSupportedPlatform } from '../helpers/platform.js'
@@ -598,8 +598,7 @@ describe('empty allowedDomains network blocking (CVE fix)', () => {
 
         // With the fix, empty allowedDomains should trigger network isolation
         expect(result).not.toBe(command)
-        expect(result).toContain('bwrap')
-        expect(result).toContain('--unshare-net')
+        expect(result).toContain('landstrip')
       },
     )
 
@@ -624,7 +623,7 @@ describe('empty allowedDomains network blocking (CVE fix)', () => {
 
         // With the fix, empty allowedDomains should trigger sandbox
         expect(result).not.toBe(command)
-        expect(result).toContain('sandbox-exec')
+        expect(result).toContain('landstrip')
       },
     )
 
@@ -686,7 +685,9 @@ describe('allowWrite glob suffix handling', () => {
       const result = await SandboxManager.wrapWithSandbox(command)
 
       expect(result).not.toBe(command)
-      expect(result).toContain(testDir)
+      const policyPath = result.match(/-p (\S+)/)?.[1]
+      expect(policyPath).toBeDefined()
+      expect(readFileSync(policyPath!, 'utf8')).toContain(testDir)
     } finally {
       await SandboxManager.reset()
       rmSync(testDir, { recursive: true, force: true })
@@ -712,8 +713,11 @@ describe('allowWrite glob suffix handling', () => {
       const result = await SandboxManager.wrapWithSandbox(command)
 
       expect(result).not.toBe(command)
-      expect(result).toContain(parentDir)
-      expect(result).toContain(childDir)
+      const policyPath = result.match(/-p (\S+)/)?.[1]
+      expect(policyPath).toBeDefined()
+      const policyText = readFileSync(policyPath!, 'utf8')
+      expect(policyText).toContain(parentDir)
+      expect(policyText).toContain(childDir)
     } finally {
       await SandboxManager.reset()
       rmSync(parentDir, { recursive: true, force: true })

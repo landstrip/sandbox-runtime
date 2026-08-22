@@ -2,7 +2,7 @@
 
 A lightweight sandboxing tool for enforcing filesystem and network restrictions on arbitrary processes at the OS level, without requiring a container.
 
-`srt` uses native OS sandboxing primitives (`sandbox-exec` on macOS, `bubblewrap` on Linux) and proxy-based network filtering. It can be used to sandbox the behaviour of agents, local MCP servers, bash commands and arbitrary processes.
+`srt` delegates OS sandbox enforcement to `@landstrip/landstrip-api@0.19.19` on Linux, macOS and Windows, while retaining its HTTP/SOCKS proxies and network filtering. There is no legacy backend fallback. Unsupported policies fail explicitly; see [Platform Support](#platform-support) before migrating.
 
 > **Beta Research Preview**
 >
@@ -102,11 +102,7 @@ Now the MCP server will be blocked from writing to the denied path:
 
 ## How It Works
 
-The sandbox uses OS-level primitives to enforce restrictions that apply to the entire process tree:
-
-- **macOS**: Uses `sandbox-exec` with dynamically generated [Seatbelt profiles](https://reverse.put.as/wp-content/uploads/2011/09/Apple-Sandbox-Guide-v1.0.pdf)
-- **Linux**: Uses [bubblewrap](https://github.com/containers/bubblewrap) for containerization with network namespace isolation
-- **Windows**: Runs the sandboxed process under a dedicated `srt-sandbox` local user account, with a [Windows Filtering Platform](https://learn.microsoft.com/en-us/windows/win32/fwp/windows-filtering-platform-start-page) egress fence keyed on that account's SID and per-session explicit ACEs on the working tree
+The runtime writes a private Landstrip policy and launches the native binary with the requested shell. Landstrip owns OS enforcement and child-process supervision; the runtime owns domain filtering, upstream proxies and request callbacks.
 
 ![0d1c612947c798aef48e6ab4beb7e8544da9d41a-4096x2305](https://github.com/user-attachments/assets/76c838a9-19ef-4d0b-90bb-cbe1917b3551)
 
@@ -121,11 +117,8 @@ Both filesystem and network isolation are required for effective sandboxing. Wit
 
 **Network Isolation** (allow-only pattern): By default, all network access is denied. You must explicitly allow domains. An empty allowedDomains list means no network access. Network traffic is routed through proxy servers running on the host:
 
-- **Linux**: Requests are routed via the filesystem over a Unix domain socket. The network namespace of the sandboxed process is removed entirely, so all network traffic must go through the proxies running on the host (listening on Unix sockets that are bind-mounted into the sandbox)
-
-- **macOS**: The Seatbelt profile allows communication only to a specific localhost port. The proxies listen on this port, creating a controlled channel for all network access
-
-- **Windows**: A machine-wide WFP filter set blocks all outbound connections originating from the `srt-sandbox` account except loopback to the proxy port range. The proxies listen inside that range, creating a controlled channel for all network access
+- **Linux/macOS**: Landstrip permits connections to the host proxy ports and enforces the requested socket restrictions.
+- **Windows**: Landstrip's provisioned restricted-user backend supplies the firewall fence. Proxy listeners use the port range reported by `landstrip windows status`, not the legacy srt-win range.
 
 Both HTTP/HTTPS (via HTTP proxy) and other TCP traffic (via SOCKS5 proxy) are mediated by these proxies, which enforce your domain allowlists and denylists.
 
@@ -152,9 +145,7 @@ src/
     ├── sandbox-utils.ts      # Shared sandbox utilities
     ├── http-proxy.ts         # HTTP/HTTPS proxy for network filtering
     ├── socks-proxy.ts        # SOCKS5 proxy for network filtering
-    ├── linux-sandbox-utils.ts # Linux bubblewrap sandboxing
-    ├── macos-sandbox-utils.ts # macOS sandbox-exec sandboxing
-    └── windows-sandbox-utils.ts # Windows srt-win sandboxing
+    └── landstrip-sandbox-utils.ts # Native policy and invocation adapter
 ```
 
 ## Usage
@@ -675,143 +666,37 @@ Watchman accesses files outside the sandbox boundaries, which will trigger permi
 
 ## Platform Support
 
-- **macOS**: Uses `sandbox-exec` with custom profiles (no additional dependencies)
-- **Linux**: Uses `bubblewrap` (bwrap) for containerization
-- **Windows**: Alpha — uses a bundled `srt-win.exe` helper (no additional dependencies). See [Windows (alpha)](#windows-alpha) below for setup, security model, and known limitations
+The Landstrip dependency includes native binaries for supported Linux, macOS and Windows architectures. Do not omit npm optional dependencies. `SandboxManager.checkDependencies()` checks the native binary with `landstrip doctor`; bubblewrap, ripgrep and the legacy seccomp loader are not execution dependencies.
 
-### Platform-Specific Dependencies
+This migration deliberately refuses policies whose former guarantees cannot be preserved:
 
-**Linux requires:**
+- **Linux:** filesystem and network policies use Landstrip. Custom seccomp/bwrap/socat paths, legacy namespace options and credential isolation requiring PID namespaces are rejected. Unrestricted TCP combined with blocked Unix sockets is unsupported.
+- **macOS:** network-only policies require `filesystem.disabled: true` and `enableWeakerNetworkIsolation: true`. Filesystem policies, strict Mach isolation, extra Mach services, PTYs and Apple Events are rejected.
+- **Windows:** configure an explicit, nonempty `filesystem.allowRead` allowlist and any `allowWrite` roots. Full-volume reads, disabled filesystem enforcement, deny rules and credential restrictions are unsupported. No mandatory write-denial guarantee is made on Windows, as with the former Windows backend. Local binding and Unix socket options are unsupported.
+- **All platforms:** literal path objects and legacy OS violation monitoring are rejected. Proxy-side violation tracking remains available.
 
-- `bubblewrap` - Container runtime
-  - Ubuntu/Debian: `apt-get install bubblewrap`
-  - Fedora: `dnf install bubblewrap`
-  - Arch: `pacman -S bubblewrap`
-- `socat` - Socket relay for proxy bridging
-  - Ubuntu/Debian: `apt-get install socat`
-  - Fedora: `dnf install socat`
-  - Arch: `pacman -S socat`
-- `ripgrep` - Fast search tool for deny path detection
-  - Ubuntu/Debian: `apt-get install ripgrep`
-  - Fedora: `dnf install ripgrep`
-  - Arch: `pacman -S ripgrep`
+The legacy configuration keys remain parseable so callers receive errors instead of silently dropping restrictions. Native policy/setup failures never trigger a retry with weaker rules.
 
-**Supported bubblewrap versions:** 0.4.0 and later, except that one thing needs 0.5.0 or newer, a change to how bubblewrap prepares the mount point for a file bind: a `denyRead` entry or credential mask naming a path that is not a regular file — a fifo, a socket, a device node — cannot be applied on an older bubblewrap, which creates a file at the destination instead of binding over what is there (that fails on a read-only mount and blocks on a fifo). `checkDependencies()` runs `bwrap --version` (once for each path of `bwrap`: the answer, or that there was none, is kept for the life of the process) and returns a warning naming the version it found when bubblewrap is older than 0.5.0; it is a warning, not a refusal. CI runs the whole suite against the bubblewrap Ubuntu ships and against 0.12.0, and the Linux mount-plan suites against 0.4.1 as well.
+### Windows setup
 
-**Ubuntu 24.04+ note:** These releases enable `kernel.apparmor_restrict_unprivileged_userns` by default, which allows `unshare(CLONE_NEWUSER)` but strips capabilities from the resulting namespace. Both bubblewrap and the seccomp isolation layer need capability-bearing user namespaces. Disable the restriction with:
-
-```bash
-sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-```
-
-or add an AppArmor profile that grants `userns` to the relevant binaries.
-
-**Running as root:** a caller with euid 0 needs `CAP_SETFCAP` in its capability bounding set. Bubblewrap's user namespace maps the caller's uid, and Linux 5.12 — and the older distribution kernels that backported the change — lets a namespace map uid 0 only when its creator held that capability; the seccomp isolation layer's nested namespace has the same requirement. Without it every sandboxed command fails with `Operation not permitted` while writing a uid map, and `initialize()` refuses to start once bubblewrap has confirmed it. Grant the capability to the calling process — it is in Docker's default set, but `capsh --drop=cap_setfcap` and a tightened `CapabilityBoundingSet=` remove it — or run as a non-root user, for which none of this applies. The bounding set is what counts, because bubblewrap is reached by `execve` and the kernel recomputes a root caller's permitted set from it.
-
-Prefer a non-root caller where there is the choice. Under the seccomp isolation layer a root caller's command still holds a full capability set inside the helper's nested user namespace, which is identity-mapped to the caller's uid 0; what holds the filesystem policy there is the helper's namespaces filter (next paragraph), not the command's capabilities: the nested namespace's copies of the mounts are locked, which refuses the unmount of any one deny but not the whole tree being moved aside with `pivot_root`. A non-root caller's command holds no capabilities at all.
-
-**The command stays in the namespaces made for it.** Every write deny on Linux is a read-only bind mount, and a bind protects a path only in the mount namespace it was made in. Creating a user namespace takes no capability and gives its creator a full capability set over a private copy of the mount tree, from which the binds can be removed; so a sandboxed command may not create one. The seccomp isolation layer enforces that with a second filter beside the Unix-socket one, which refuses `unshare` and `clone` with the user-namespace or the mount-namespace flag, `setns`, `mount`, `umount2`, `pivot_root` and the newer mount calls (`EPERM`), and `clone3` (`ENOSYS`, which sends libc and the language runtimes to `clone`), and with `user.max_user_namespaces` set to zero in the helper's own user namespace.
-
-What stops working as a result is whatever sandboxes itself with user namespaces: Chromium's and Electron's namespace sandbox, rootless podman and buildah, a nested bubblewrap or `srt`, `unshare -r` in a build script. They fail with `EPERM` (`unshare: unshare failed: Operation not permitted`); a nested bubblewrap blames a kernel setting and suggests a `sysctl`, which does not apply here. A root caller's command also loses `mount`, `umount` and `setns` for purposes of its own (`unshare -m`, `nsenter`, `ip netns exec`), and a direct `clone3` call has no fallback. The cure is `allowNestedUserNamespaces: true`, at the price stated under that option. Known limits:
-
-- With no seccomp helper in the chain (`allowAllUnixSockets`, or no helper for the architecture) bubblewrap is given `--disable-userns` instead, which refuses a new user namespace (`ENOSPC`, `No space left on device`) and nothing else. That needs bubblewrap 0.8.0 or later, not installed setuid, and `enableWeakerNestedSandbox` off; where it cannot be done nothing limits namespaces, and a warning is logged once per process. **So `allowAllUnixSockets` and `enableWeakerNestedSandbox` together leave the limit off,** as `allowNestedUserNamespaces` does: an application that takes its options from several sources should trust whoever may set those two as far as whoever may set that one.
-- A helper built before this release (an embedder's own, through `seccomp.applyPath` or `seccomp.argv0`) imposes no limit, and nothing says so: rebuild it from this release's `vendor/seccomp-src`.
-
-**Optional Linux dependencies (for seccomp fallback):**
-
-The package includes pre-generated seccomp BPF filters for x86-64 and arm architectures. These dependencies are only needed if you are on a different architecture where pre-generated filters are not available:
-
-- `gcc` or `clang` - C compiler
-- `libseccomp-dev` - Seccomp library development files
-  - Ubuntu/Debian: `apt-get install gcc libseccomp-dev`
-  - Fedora: `dnf install gcc libseccomp-devel`
-  - Arch: `pacman -S gcc libseccomp`
-
-**macOS requires:**
-
-- `ripgrep` - Fast search tool for deny path detection
-  - Install via Homebrew: `brew install ripgrep`
-  - Or download from: https://github.com/BurntSushi/ripgrep/releases
-
-**Windows requires:**
-
-- No additional dependencies. The `srt-win.exe` helper (x64 and arm64) is bundled with the npm package. A one-time elevated `windows-install` step is required — see below.
-
-## Windows (alpha)
-
-Windows support is **alpha**. The sandboxed process runs under a dedicated `srt-sandbox` local user account, isolated from the calling user by native Windows security primitives — a Windows Filtering Platform (WFP) egress fence keyed on the sandbox account's SID, and per-session explicit ACEs that grant or deny that SID access to configured filesystem paths.
-
-### Setup
-
-Run once per machine (self-elevates; one UAC prompt):
+Install Landstrip's restricted-user isolation once, then inspect its health:
 
 ```powershell
 npx @anthropic-ai/sandbox-runtime windows-install
+npx @anthropic-ai/sandbox-runtime windows-status
 ```
 
-This provisions the `srt-sandbox` local user account (with a random password stored DPAPI-encrypted in `HKLM\SOFTWARE\sandbox-runtime` — machine-wide, so fleet installs running as SYSTEM work and one user's rotation updates the copy the others read), the `sandbox-runtime-users` local group, and installs a machine-wide WFP filter set keyed on the `srt-sandbox` SID. It is **idempotent** — re-running it rotates the sandbox account's password and reconciles the filter set.
+These commands delegate to `landstrip windows install` and `landstrip windows status`. Existing srt-win installations are not reused; uninstall them using the legacy administrative API or helper before migration. Legacy administrative exports are retained for that purpose, but are disconnected from execution. Legacy `windows` configuration settings are rejected.
 
-**No logout is required.** The WFP filters key on the dedicated sandbox account's SID, so your own network, services, and every other principal on the machine are unaffected.
+Use `SandboxManager.wrapWithSandboxArgv()` and spawn its `{argv, env}` with `{shell: false}`. The string-returning `wrapWithSandbox()` API is not supported on Windows. External proxy ports must fit inside Landstrip's provisioned firewall range. Prefer machine-wide tools, or include per-user tool locations in `filesystem.allowRead`.
 
-After install, `SandboxManager.initialize()` and the `srt` CLI work as on other platforms. `initialize()` verifies the sandbox account and WFP fence are live, and fails with an actionable error if not.
-
-Programmatic install/uninstall are exported as `installWindowsSandbox()` / `uninstallWindowsSandbox()`.
-
-### Security model
-
-The sandboxed command runs **as the `srt-sandbox` account**, not as the calling user. The bundled `srt-win.exe` helper does a two-hop launch: the broker calls `CreateProcessWithLogonW` to start a runner as `srt-sandbox`, and the runner spawns the target under a restricted token inside a job object. The child inherits the sandbox account's isolated profile (`%USERPROFILE%`, `%TEMP%`, `HKCU`) and a fresh environment overlaid with only the broker's `PATH` and the generated proxy variables.
-
-Running under a distinct user SID structurally closes the surrogate-spawn class of escape (Task Scheduler, `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` onto a broker-owned process, BITS, out-of-process COM with `RunAs="Interactive User"`): any process the child manages to spawn out-of-band still carries the `srt-sandbox` SID, so it remains subject to the WFP egress fence and has no rights on the calling user's files.
-
-**Network isolation** is a two-filter WFP set at `FWPM_LAYER_ALE_AUTH_CONNECT_V4/V6`: a PERMIT for loopback destinations inside the configured proxy port range (default `60080–60089`), and a BLOCK for any connect whose token carries the `srt-sandbox` SID. The sandboxed process reaches the internet only via the JS HTTP/SOCKS5 proxies listening in that range; a process that strips its proxy environment and connects directly is blocked at the kernel.
-
-**Filesystem isolation** is enforced by NTFS discretionary ACLs. The `srt-sandbox` account has no inherent rights on the calling user's files, so at `initialize()` the sandbox writes **additive, inheriting explicit ACEs for the `srt-sandbox` SID only** — it never rewrites or replaces a path's existing security descriptor:
-
-- `filesystem.allowWrite` → an inheriting `MODIFY` ALLOW ACE (`READ|WRITE|EXECUTE|DELETE`, with `FILE_DELETE_CHILD` withheld). The sandboxed process can create, modify, and delete files inside the working tree; withholding `FILE_DELETE_CHILD` from the grant is defense-in-depth for the deny stamps below, not a guard on the tree root.
-- `filesystem.allowRead` → an inheriting `READ|EXECUTE` ALLOW ACE
-- `filesystem.denyRead` / `filesystem.denyWrite` → an inheriting DENY ACE on the target, plus an inheriting `FILE_DELETE_CHILD` DENY on its parent — together with the withheld `FILE_DELETE_CHILD` on the working-tree grant, this stops the sandboxed process from renaming or deleting a denied path via its parent directory
-- `credentials.files` → the DENY of `denyRead`, for `mode: "deny"` and `mode: "mask"` alike: an ACL cannot redirect a read, so a masked file is unreadable inside the sandbox, as on macOS
-
-The lists rank as on the other platforms. The ACEs set on an object come before the ones it inherits, so an `allowRead` beneath a `denyRead` directory is readable. An `allowWrite` at or beneath a `denyWrite` path grants `READ|EXECUTE` only, and an `allowRead` or `allowWrite` at or beneath a `credentials.files` entry grants nothing. "Beneath" is decided on the paths as they resolve on disk: links, junctions, 8.3 names and letter case make no difference (a UNC path is compared as spelled, whatever its case). A deny that one command brings in its `customConfig` ranks the same way against the session's grants.
-
-`reset()` removes every ACE this session added (refcounted across this user's concurrent hosts via the per-user session DB; a crash-recovery pass on the next `initialize()` cleans up after an unclean exit). Directory targets are supported (the ACEs inherit to the whole subtree). Glob patterns are expanded to concrete paths at `initialize()` time — a matching path that appears later is not covered. A pattern is walked from the literal directory it starts with, a drive root or the root of a share included (`C:\Users*\.ssh\*`, `\\server\share\*.pem`); a `**` right below such a root lists the whole volume. In an entry without `*` or `?`, `[` and `]` are characters of the name. In a pattern they are read as a character class, as on the other platforms, and the pattern is also expanded beneath a folder that has them in its name.
-
-### TLS termination on Windows
-
-`network.tlsTerminate` requires the MITM CA to be present in the **sandbox user's** `CurrentUser\Root` certificate store (schannel — the TLS backend used by `System32\curl.exe`, PowerShell `Invoke-WebRequest`, .NET, and default-backend `git` — trusts only the OS store, not environment variables). This is an install-time step, separate from `windows-install`:
-
-```typescript
-import { windowsTrustCa } from '@anthropic-ai/sandbox-runtime'
-windowsTrustCa('/path/to/mitm-ca.crt') // or: srt-win user trust-ca <path>
-```
-
-`initialize()` compares the session CA's thumbprint against the installed one and fails with an actionable message on mismatch, so a stale install-time CA cannot silently break TLS inside the sandbox.
-
-OpenSSL-backed clients (msys2 `curl`, `git -c http.sslBackend=openssl`, Node, Python, cargo) are covered by the env-var trust layer: the same trust bundle used on macOS/Linux is passed into the sandbox via `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `CARGO_HTTP_CAINFO`, etc., and the bundle path is added to the session's `allowRead` grant so the sandbox account can open it.
-
-### Windows-specific configuration
-
-The cross-platform `filesystem` and `network` blocks apply as described above. Windows-only settings live under `windows`:
-
-- `windows.proxyPortRange` — `[low, high]` inclusive port range the JS proxies bind inside. **Must match** the range passed to `windows-install --proxy-port-range` (default `[60080, 60089]`) — the WFP loopback PERMIT only covers that range.
-- `windows.sublayerGuid` — WFP sublayer GUID under which the filters were installed. Omit to use the compile-time default; set only when enterprise tooling installed the filters under a custom sublayer.
-- `windows.srtWin.path` — path to the `srt-win` binary. Omit to resolve the packaged `vendor/srt-win/<arch>/srt-win.exe`. Set when embedding `srt-win`'s CLI into a multicall binary; spawns then pass `--srt-win` as `argv[1]` so the embedder's dispatcher can route to `srt_win::run_from_args`.
-
-### Known limitations
-
-- **Certificate revocation under schannel.** CryptoAPI's CRL/OCSP fetch goes out via WinHTTP under the caller's token, ignoring the proxy environment, so it is blocked by the WFP egress fence. Tools that use schannel with revocation checking on by default fail with `CRYPT_E_REVOCATION_OFFLINE` (`0x80092013`) unless revocation is disabled per tool: `curl --ssl-no-revoke`, `git -c http.schannelCheckRevoke=false`, `CARGO_HTTP_CHECK_REVOKE=false`. `Invoke-WebRequest`, .NET `HttpClient`, and `gh` do not check revocation by default and are unaffected. A CRL distribution point served from the loopback proxy is planned to remove this workaround.
-- **Per-user tool installs are not reachable.** The sandboxed process runs as `srt-sandbox`, not as you, so tools installed under your profile (nvm/fnm-managed Node, per-user `winget`/Scoop packages, `pip install --user`, `%LOCALAPPDATA%\Programs\…`) resolve on the inherited `PATH` but cannot be opened by the sandbox account. Prefer machine-wide installs (`Program Files`, `choco`/`winget --scope machine`), or add the specific profile paths to `filesystem.allowRead`.
-- **Per-exec `filesystem.allowRead` / `filesystem.allowWrite` overrides are not supported.** Session-level `allowRead`/`allowWrite` (in the config passed to `initialize()`) work as described above; passing them per-command in `wrapWithSandbox`'s `customConfig` throws — grants are applied session-wide via `srt-win acl grant` at `initialize()`, and `srt-win exec` only exposes per-exec denies.
-- **`proxyAuthToken` is visible in the runner's command line.** The proxy environment (including `HTTP_PROXY=http://srt:<token>@127.0.0.1:…`) is passed to the two-hop runner as `--env` arguments on `srt-win exec`'s argv, so the token is readable by any local principal that can open the runner process for `PROCESS_QUERY_LIMITED_INFORMATION`. The token exists so the sandboxed process can authenticate to the loopback proxy, so it is not a secret from the sandbox itself; on a single-user development machine this is generally acceptable, but on a shared host treat the proxy allowlist as reachable by other same-session principals.
-- **DNS resolution via the system resolver is not fenced.** `getaddrinfo()` is serviced by the `Dnscache` service running as `NETWORK SERVICE`, so name resolution succeeds even though the subsequent `connect()` from the sandboxed process is blocked. Tools that do their own UDP/53 (`nslookup`, `dig`) are fenced. This mirrors the macOS behaviour.
-
-### Uninstall
+TLS clients using environment-based trust can use the generated CA bundle. No automatic Windows certificate-store provisioning is performed; Schannel clients need separately configured trust.
 
 ```powershell
 npx @anthropic-ai/sandbox-runtime windows-uninstall
 ```
 
-Removes the WFP filter set, the `srt-sandbox` account and its profile, the `sandbox-runtime-users` group, and removes the `HKLM\SOFTWARE\sandbox-runtime` key (credential, marker, CA record) — one UAC prompt. `%ProgramData%\sandbox-runtime` (the CA key material) is left in place; delete it (and `%LOCALAPPDATA%\sandbox-runtime` per user) manually for a full sweep.
+This removes Landstrip's restricted-user installation, not an old srt-win installation.
 
 ## Development
 
@@ -835,9 +720,7 @@ npm run lint
 npm run format
 ```
 
-### Building Seccomp Binaries
-
-The BPF filter and `apply-seccomp` loader are compiled from C source in `vendor/seccomp-src/` via `npm run build:seccomp` (Linux only; needs `gcc` and `libseccomp-dev`). CI runs it before tests on each Linux arch, and the release workflow builds both arches and bundles them into the published package.
+Legacy platform utility modules and their build scripts remain for compatibility; the manager no longer invokes their enforcement or cleanup paths.
 
 ## Implementation Details
 
@@ -849,13 +732,7 @@ The sandbox runs HTTP and SOCKS5 proxy servers on the host machine that filter a
 2. **Other Network Traffic**: A SOCKS5 proxy handles all other TCP connections (SSH, database connections, etc.)
 3. **Permission Enforcement**: The proxies enforce the `permissions` rules from your configuration
 
-**Platform-specific proxy communication:**
-
-- **Linux**: Requests are routed via the filesystem over Unix domain sockets (using `socat` for bridging). The network namespace is removed from the bubblewrap container, ensuring all network traffic must go through the proxies.
-
-- **macOS**: The Seatbelt profile allows communication only to specific localhost ports where the proxies listen. All other network access is blocked.
-
-- **Windows**: A WFP `ALE_AUTH_CONNECT` filter blocks every outbound connect from the `srt-sandbox` account except loopback to the configured proxy port range. The proxies bind inside that range. Environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, …) point tools at the proxies, but the WFP filter is the boundary — a process that ignores or unsets them is still fenced.
+**Proxy communication:** Landstrip enforces access to the configured host proxy ports. On Windows the listeners are allocated inside its installed restricted-user firewall range. The proxy environment is an application compatibility layer, not the security boundary.
 
 **git over SSH (macOS/Linux):** `ssh` reads no proxy variable, so srt sets `GIT_SSH_COMMAND` to an `ssh` whose `ProxyCommand` opens an HTTP CONNECT through the proxy and presents its token: `socat` on Linux, and on macOS a `/bin/sh` script around `/usr/bin/nc`, carried in `SRT_SSH_PROXY_COMMAND`, which keeps the token out of the arguments of `ssh` and of what it starts. (On macOS, a `socksProxyPort` or `httpProxyPort` of your own keeps `nc -X 5` to the SOCKS port.) The destination is held to `allowedDomains` / `deniedDomains` like any other: `github.com` admits port 22, `github.com:443` does not. On macOS a refusal is one line on stderr before ssh's own, with the proxy's reason: `sandbox proxy: github.com:22: 403 host is not on the allow list`. On Linux it is up to `socat`: 1.8.1 prints the reason, 1.8.0 nothing. What ssh needs to authenticate is a separate matter: its agent's socket has to be in `allowUnixSockets`, and its keys readable. An `ssh` that git does not start is not covered.
 
@@ -889,155 +766,21 @@ A program built with `bun build --compile` runs on the Bun that built it, so bui
 
 ### Filesystem Isolation
 
-Filesystem restrictions are enforced at the OS level:
+The adapter passes filesystem paths and glob patterns to Landstrip without host-side traversal or bubblewrap mount construction. Landstrip resolves the policy relative to the command's `cwd`. Windows uses explicit read roots; macOS filesystem restrictions are currently refused rather than weakening the former ancestor-move and symlink protections.
 
-- **macOS**: Uses `sandbox-exec` with dynamically generated Seatbelt profiles that specify allowed read/write paths
-- **Linux**: Uses `bubblewrap` with bind mounts, marking directories as read-only or read-write based on configuration
-- **Windows**: Writes additive `(OI)(CI)` explicit ACEs for the `srt-sandbox` SID onto the configured paths (ALLOW on `allowRead`/`allowWrite`, DENY on `denyRead`/`denyWrite`), then removes them at `reset()`
-
-**Default filesystem permissions:**
-
-- **Read** (deny-then-allow): Allowed everywhere by default. You can deny broad regions, then re-allow specific paths within them. `allowRead` takes precedence over `denyRead`.
-
-  - Example: `denyRead: ["~/.ssh"]` to block access to SSH keys
-  - Example: `denyRead: ["/Users"], allowRead: ["."]` to block all of `/Users` except the workspace
-  - Empty `denyRead: []` = full read access (nothing denied)
-
-- **Write** (allow-only): Denied everywhere by default. You must explicitly allow paths.
-  - Example: `allowWrite: [".", "/tmp"]` to allow writes to current directory and /tmp
-  - Empty `allowWrite: []` = no write access (nothing allowed)
-  - `denyWrite` creates exceptions within allowed paths (deny takes precedence)
-
-**Precedence is intentionally opposite for reads vs writes:** `allowRead` overrides `denyRead`, while `denyWrite` overrides `allowWrite`. This lets you carve out readable regions within denied areas, and carve out protected regions within writable areas. On Linux and Windows that also holds when the `denyWrite` entry is at or above the `allowWrite` one — `allowWrite: ["/", "/work"]` with `denyWrite: ["/"]` leaves `/work` read-only rather than writable — and with debug logging on (`SRT_DEBUG`) a warning names both paths.
-
-**Writes through links (Linux and macOS):** a write is judged by where it lands, after symbolic links are followed. A link inside an allowed write path that leads out of it gives a command nothing: the write is refused. A link that leads into an allowed write path works like any other name for that place. A hard link is a second name for the file itself: on Linux a file outside the allowed write paths that already has a hard link inside one can be written through it, and a sandboxed command cannot create such a link. On macOS nothing is promised for such a file.
-
-**Read-side rules (Linux):** an entry is matched by the name it is, not by what it points at.
-
-- An `allowRead` entry re-allows the name it names, so a link planted at an allowed path cannot re-open a denied one. One that is itself a symlink is bound back at its own name, from the target it was checked against: the target's own path stays hidden, and the target's contents are reachable only through the name. A `denyRead` entry or a credential mask that overlaps that target — at it, inside it, or covering it — wins over the carve-out, which is then not restored at all: the name is absent inside the sandbox rather than serving what the deny hides. The denied directory the carve-out is being restored into is not such an overlap, nor is anything above it: those are what the carve-out is an exception to. Neither is an entry that denies nothing — one naming a path that is not there, or a file an `allowRead` entry lifts.
-- A `denyRead` of `/` together with an `allowRead` of `/` denies nothing: the root deny is expanded into the root's children, and the allow covers every one of them.
-- A `denyRead` entry naming a FILE is lifted only by an `allowRead` entry naming that same file. An `allowRead` entry that is a symlink to it names the link, so it does not cancel the deny of its target.
-- A `denyRead` entry that cannot be inspected (a parent made unsearchable, a dead network mount) hides the deepest directory above it that can be — never `/`, so when `/` is the only one left the entry mounts nothing and that deny is not enforced (the wrap logs which entry, and why, under `SRT_DEBUG`). Such a stand-in hides more than was written: nothing beneath it is readable, carve-outs named there included, and a carve-out elsewhere that resolves beneath it is not restored either.
-
-**Write denies on paths that do not exist yet (Linux):** bubblewrap can only deny a path by mounting over it, so for a `denyWrite` path that is absent under a writable directory it first creates a mount point there: an empty, read-only file (or an empty directory for a missing intermediate component) that is visible on the host for as long as a sandbox is alive and is removed afterwards. Host tools therefore see such a path as existing while a sandboxed command runs, which matters for paths whose existence is their meaning (a lockfile such as `.git/config.lock` makes `git config` report "could not lock config file"). A process that dies without an exit event (`SIGKILL`, OOM) cannot remove its mount points, and nothing removes them later: they cannot be told from an empty file or directory of your own, or from the mount points of another process's sandbox that is still running. A later command finds a path that exists, binds it read-only like any other, and leaves it on the host until you remove it. Where a file lies above the path (`denyWrite: ["f/x"]`, and `f` is a file), no mount point can be made below it: the file itself is bound read-only, which keeps it there.
-
-- No mount point is made where none can be: in a directory that refuses this user, when the refusal is not this user's to lift (another user's directory it may not write, a read-only file system, an immutable directory). bubblewrap could not create the path there, and would stop every command from starting; the sandboxed command cannot create it either, so the deny holds without a mount. The directories above the path are kept from being moved aside as for any other deny. A directory of your own that only its mode closes keeps its mount point, because the command could open it with `chmod`. Should somebody else lift the refusal while a command runs (the owner, an administrator, a remount), that command can create the path; the next one gets its mount point.
-- On a Windows drive under WSL 2 (`/mnt/c`, a 9p mount) the Windows ACL decides what can be created, and Linux is told nothing of it: every folder looks like yours and writable. The only way to know is to try, so there, and only there, the library makes the mount point itself while it wraps the command, instead of leaving it to bubblewrap when the command runs: the same empty file or directory, at the same path, removed by the same clean-up. It is on the drive from the wrap on, also for a command that is never run, until `cleanupAfterCommand()` or `reset()`. A file deny in a folder that takes subfolders but no files (`C:\`) is covered by an empty directory. If nothing can be made and the folder refuses even to be given the mode it has, no mount point is made, as above.
-
-**Note (Linux, large profiles):** The wrapped string runs as one argument of `sh -c`, which Linux caps at 32 pages (128 KiB with 4 KiB pages). A profile that would not fit, with 4 KiB to spare for a prefix of the caller's own, has its mounts written to an unnamed file (`O_TMPFILE`) that the wrapping process holds open and bubblewrap reads through `--args`. The string then reads `/bin/sh -c '…' srt-args /proc/<wrapping pid>/fd/<n> bwrap … --args 9 …`: still a simple command, which opens the profile on fd 9 and runs bubblewrap. The environment and the command stay on the command line; the file holds mount paths only.
-
-- The profile is never given a name, so nothing can be put in its place between the wrap and the execution — not a command the process sandboxed, not a sandbox another process of the same user started with tmpdir writable, not a rename of a directory above `TMPDIR`. Every sandbox this library starts has its own PID namespace and a fresh `/proc`, so none of them can reach `/proc/<wrapping pid>` either.
-- Not covered: another process of the same user running outside a sandbox can read a pending profile through `/proc`. It can already read the wrapping process's memory, so this gives it nothing new.
-- The string must be run while the process that produced it is alive, and before the runtime cleans up after that command (`cleanupAfterCommand()`), which is when the profile is released.
-- The profile needs a directory that takes an `O_TMPFILE` file — `os.tmpdir()`, else `/dev/shm` — and a readable `/proc/self/fd`. Without them an over-long profile is refused at wrap time with the reason; there is no fallback to a named file. Profiles that fit the command line do not use any of this.
-- bubblewrap parses at most 9000 arguments (about 3000 mounts). A profile past that, or a command too long for one argument by itself, fails at wrap time with an error. The [mandatory deny paths](#mandatory-deny-paths-auto-protected-files) count too, and no list in the configuration holds them: a git repository directly inside a writable working directory takes four mounts (its hooks, its config, and the two directories above them), so some 730 repositories reach the limit by themselves. The error says how many of the arguments are theirs. There are fewer when the command runs from a directory with fewer repositories in it, or when `allowWrite` names fewer of them; a lower `mandatoryDenySearchDepth` leaves the deeper ones unprotected.
-- Every one of these wrap-time refusals is a `LinuxSandboxProfileError`, exported from the package root, with a `LinuxSandboxProfileErrorCode` on `.code` to tell the cases apart; branch on `.code` rather than on the message. They say the configuration expands to a profile this host cannot run, except `command_too_long` and `nul_in_path`, which also fire on what the embedding program passed in. A wrap that threw has already released what it held: do not call `cleanupAfterCommand()` for it, or a sandbox still running loses its mount points.
+Policy files have unique names in a private temporary directory and are removed at session reset/exit. Run returned invocations before resetting the manager. `cleanupAfterCommand()` remains a compatibility no-op; no legacy host mount-point placeholders or anonymous bubblewrap args files are created.
 
 ### Mandatory Deny Paths (Auto-Protected Files)
 
-Certain sensitive files and directories are **always blocked from writes**, even if they fall within an allowed write path. This provides defense-in-depth against sandbox escapes and configuration tampering.
-
-**Always-blocked files:**
-
-- Shell config files: `.bashrc`, `.bash_profile`, `.zshrc`, `.zprofile`, `.profile`
-- Git config files: `.gitconfig`, `.gitmodules`
-- Other sensitive files: `.ripgreprc`, `.mcp.json`
-
-**Always-blocked directories:**
-
-- IDE directories: `.vscode/`, `.idea/`
-- Claude config directories: `.claude/commands/`, `.claude/agents/`
-- Git hooks and config: `.git/hooks/`, `.git/config`. Where the working directory is a worktree or a submodule, its `.git` is a file: on Linux that file is blocked, so it can be read but not changed, moved or removed.
-
-These paths are blocked automatically - you don't need to add them to `denyWrite`. For example, even with `allowWrite: ["."]`, writing to `.bashrc` or `.git/hooks/pre-commit` will fail:
-
-```bash
-$ srt 'echo "malicious" >> .bashrc'
-/bin/bash: .bashrc: Operation not permitted
-
-$ srt 'echo "bad" > .git/hooks/pre-commit'
-/bin/bash: .git/hooks/pre-commit: Operation not permitted
-```
-
-**Note (Linux):** A mandatory deny path that does not exist yet is blocked as well. bubblewrap covers it with a read-only `/dev/null`, or mounts an empty read-only directory at the first missing intermediate component, and those host mount points are removed by `cleanupAfterCommand()` — see "Write denies on paths that do not exist yet (Linux)" above. macOS uses glob patterns, which cover existing and new files alike.
-
-**Pinned directories (Linux):** Every existing ancestor of a protected path (a write-denied path, a read-denied file or directory, a masked credential file) up to the allowed write root covering it is made a mountpoint — "pinned" — and cannot be renamed or removed from inside the sandbox: `mv` or `rmdir` of such a directory (for example a nested repository's parent) fails with `EBUSY` ("Device or resource busy"), and `rm -rf` of a nested repository leaves the pinned directories and the protected files behind (as with `.git/hooks`). A pin is buried under the mounts above it, so it never appears on a lookup path: reads, writes, creation, renames and hard links inside or across a pinned directory are unaffected.
-
-With `allowWrite: ["/"]` the pins reach every ancestor, including any other allowed write root that is one (`mv /work /work.bak` fails with `EBUSY` given `allowWrite: ["/", "/work"]` and a protected path inside `/work`). They stop below the top-level directory, which is bound writable over them, and that directory is the one new filesystem boundary: `mv` or `ln` between two top-level directories — say `/tmp` and `/home` — fails with `EXDEV` ("Invalid cross-device link"), as it does on any host where they are separate filesystems. `mv` falls back to a copy; `ln` and a raw `rename(2)` do not.
-
-A wrap that carries no write restrictions at all — `filesystem.disabled` with credential masks still in force, or a library caller passing no write config while a `denyRead` entry or a mask still seeds a pin — is the same shape: the whole tree is bound writable, so it gets the same pins and the same top-level covers, and the same `EXDEV` boundary applies there too.
-
-**Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance: a dangerous file is found down to `a/b/.bashrc`, and a dangerous directory, or the hooks and config of a repository, one level higher up (`a/.vscode`, `a/.claude/commands`, `a/.git/hooks`). Ignore files (`.gitignore`, `.ignore`) do not hide anything from it, and a directory of the user's own that it cannot read is denied whole. A dangerous directory other than a repository's hooks is only seen if it holds a file directly: below the working directory, one that is empty or does not exist yet can be filled. A repository that has no `hooks` directory has an empty file in its place while a command runs, which stops `git init` from being run again there and a hook from being installed. You can configure this with `mandatoryDenySearchDepth`:
-
-```json
-{
-  "mandatoryDenySearchDepth": 5,
-  "filesystem": {
-    "allowWrite": ["."]
-  }
-}
-```
-
-- Default: `3` (searches up to 3 levels deep)
-- Range: `1` to `10`
-- Higher values provide more protection but slower performance
-- Files in CWD (depth 0) are always protected regardless of this setting
+On Linux, when filesystem restrictions are enabled, native deny patterns protect shell/IDE configuration, `.git/hooks` and `.git/config` under `cwd`, including nested paths. `filesystem.allowGitConfig` removes the `.git/config` protection. The rules are passed to Landstrip; there is no ripgrep scan or `mandatoryDenySearchDepth` traversal. These guarantees do not apply with filesystem enforcement disabled or to the Windows allowlist mode.
 
 ### Unix Socket Restrictions (Linux)
 
-On Linux, the sandbox uses **seccomp BPF (Berkeley Packet Filter)** to block Unix domain socket creation at the syscall level. This provides an additional layer of security to prevent processes from creating new Unix domain sockets for local IPC (unless explicitly allowed).
-
-**How it works:**
-
-1. **Baked-in BPF filter**: The package ships a static `apply-seccomp` binary for x64 and arm64 with the seccomp BPF filter compiled in. The filter is architecture-specific but libc-independent, so the binary works with both glibc and musl.
-
-2. **Runtime detection**: The sandbox automatically detects your system's architecture and uses the matching `apply-seccomp` binary.
-
-3. **Syscall filtering**: The BPF filter intercepts the `socket()` syscall and blocks creation of `AF_UNIX` sockets by returning `EPERM`. This prevents sandboxed code from creating new Unix domain sockets.
-
-4. **Two-stage application using apply-seccomp binary**:
-   - Outer bwrap creates the sandbox with filesystem, network, and PID namespace restrictions
-   - Network bridging processes (socat) start inside the sandbox (need Unix sockets), and the wrapper waits until both listen
-   - apply-seccomp creates a nested user+PID+mount namespace and remounts `/proc`
-   - Inside the nested namespace, apply-seccomp acts as PID 1 (non-dumpable init/reaper)
-   - apply-seccomp forks, applies the seccomp filter via `prctl()`, and execs the user command
-   - User command runs with all sandbox restrictions plus Unix socket creation blocking
-
-**PID namespace isolation**: The nested PID namespace ensures the user command cannot see or address any process that runs without the seccomp filter (bwrap's init, the shell wrapper, or the socat helpers). This keeps the seccomp boundary intact regardless of `kernel.yama.ptrace_scope`, since unfiltered helpers are not reachable via `ptrace` or `/proc/N/mem`. The inner PID 1 sets `PR_SET_DUMPABLE=0` so it is not ptraceable either. If nested namespace creation fails, apply-seccomp aborts rather than running without isolation.
-
-**Security limitations**: The filter blocks `socket(AF_UNIX, ...)` and the `io_uring_setup`/`io_uring_enter`/`io_uring_register` syscalls (the latter three because `IORING_OP_SOCKET` on Linux 5.19+ would otherwise bypass the `socket()` rule). It does not prevent operations on Unix socket file descriptors inherited from parent processes or passed via `SCM_RIGHTS`. For most sandboxing scenarios, blocking socket creation is sufficient to prevent unauthorized IPC.
-
-**Zero runtime dependencies**: Pre-built static apply-seccomp binaries and pre-generated BPF filters are included for x64 and arm64 architectures. No compilation tools or external dependencies required at runtime.
-
-**Architecture support**: x64 and arm64 are fully supported with pre-built binaries. Other architectures are not currently supported. To use sandboxing without Unix socket blocking on unsupported architectures, set `allowAllUnixSockets: true` in your configuration.
+Landstrip owns Unix socket enforcement. `network.allowUnixSockets` supplies path-specific allowances, and `network.allowAllUnixSockets` requests unrestricted Unix sockets. No socat bridge or bundled apply-seccomp loader is used by the manager.
 
 ### Violation Detection and Monitoring
 
-When a sandboxed process attempts to access a restricted resource:
-
-1. **Blocks the operation** at the OS level (returns `EPERM` error)
-2. **Logs the violation** (platform-specific mechanisms)
-3. **Notifies the user** (in Claude Code, this triggers a permission prompt)
-
-**macOS**: The sandbox runtime taps into macOS's system sandbox violation log store. This provides real-time notifications with detailed information about what was attempted and why it was blocked. This is the same mechanism Claude Code uses for violation detection.
-
-```bash
-# View sandbox violations in real-time
-log stream --predicate 'process == "sandbox-exec"' --style syslog
-```
-
-**Linux**: Bubblewrap doesn't provide built-in violation reporting. Use `strace` to trace system calls and identify blocked operations:
-
-```bash
-# Trace all denied operations
-strace -f srt <your-command> 2>&1 | grep EPERM
-
-# Trace specific file operations
-strace -f -e trace=open,openat,stat,access srt <your-command> 2>&1 | grep EPERM
-
-# Trace network operations
-strace -f -e trace=network srt <your-command> 2>&1 | grep EPERM
-```
+The violation store still records proxy-side network refusals and command attribution. OS violation monitoring is not integrated with the Landstrip wrapper, so requesting it fails explicitly. Child stderr is never accepted as an authenticated violation channel.
 
 ### Advanced: Bring Your Own Proxy
 
